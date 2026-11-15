@@ -27,6 +27,11 @@ uv run pytest
 uv run python scripts/load_test.py
 ```
 
+## Benchmark
+
+Completed 100 streaming requests in 6.71s
+p50: 1084.21ms | p95: 2328.51ms | p99: 2590.80ms
+
 ## Project Status & Next Milestones
 - [x] **Milestone 1:** Async SSE streaming proxy with persistent `httpx` connection pooling & TTFT telemetry
 - [x] **Milestone 2:** Atomic Redis Lua pre-auth holds, idempotency cache, and post-stream settlement
