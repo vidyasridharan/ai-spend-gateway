@@ -22,3 +22,10 @@ build-backend = "uv_build"
 module-name = "gateway"
 module-root = "src"
 
+[dependency-groups]
+dev = [
+    "fakeredis[lua]>=2.40.0",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.5.0",
+]
+
