@@ -1,29 +1,33 @@
 import json
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 import httpx
+import redis.asyncio as redis
 import tiktoken
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from gateway.config import settings
+from gateway.ledger import SpendLedger
 
-# Reuse tokenizer across requests to avoid initialization overhead
 ENCODING = tiktoken.get_encoding("o200k_base")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Persistent connection pool to upstream LLM provider
     app.state.http_client = httpx.AsyncClient(
         base_url=settings.upstream_base_url,
         timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0),
         limits=httpx.Limits(max_keepalive_connections=100, max_connections=500),
     )
+    app.state.redis = redis.from_url(settings.redis_url, decode_responses=False)
+    app.state.ledger = SpendLedger(app.state.redis, default_session_budget=10_000)
     yield
     await app.state.http_client.aclose()
+    await app.state.redis.aclose()
 
 
 app = FastAPI(title="AI Spend-Control Gateway", lifespan=lifespan)
@@ -50,14 +54,32 @@ async def proxy_chat_completions(
     if not payload.get("stream", False):
         raise HTTPException(
             status_code=400,
-            detail="Gateway currently enforces stream=true for real-time token metering.",
+            detail="Gateway enforces stream=true for real-time token metering.",
         )
 
+    idemp_key = x_idempotency_key or str(uuid.uuid4())
     messages = payload.get("messages", [])
     prompt_tokens = count_prompt_tokens(messages)
+    max_completion_est = payload.get("max_tokens", settings.default_preauth_tokens)
+    estimated_total = prompt_tokens + max_completion_est
 
-    # TODO (Weekend 2): Call Redis Lua script here to place pre-auth hold
-    # using x_agent_session_id and x_idempotency_key
+    # 1. Atomic Pre-Authorization Hold
+    ledger: SpendLedger = request.app.state.ledger
+    preauth = await ledger.pre_authorize(
+        session_id=x_agent_session_id,
+        idempotency_key=idemp_key,
+        estimated_tokens=estimated_total,
+    )
+
+    if not preauth.approved:
+        status_code = 409 if preauth.reason == "DUPLICATE_REQUEST" else 402
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                "error": preauth.reason,
+                "remaining_tokens": preauth.remaining_tokens,
+            },
+        )
 
     headers = {
         "Authorization": f"Bearer {settings.upstream_api_key}",
@@ -92,7 +114,6 @@ async def proxy_chat_completions(
                         print(f"[{x_agent_session_id}] TTFT: {ttft_ms:.2f}ms")
                         first_token_logged = True
 
-                    # Inspect SSE data payload without delaying chunk forwarding
                     if line.startswith("data: ") and line != "data: [DONE]":
                         raw_json = line[6:]
                         try:
@@ -106,16 +127,20 @@ async def proxy_chat_completions(
                     yield f"{line}\n\n".encode("utf-8")
 
         finally:
-            # Guaranteed settlement block: executes on normal completion OR client disconnect
+            # 2. Guaranteed Post-Stream Settlement & Hold Release
             full_output = "".join(completion_text_chunks)
             completion_tokens = len(ENCODING.encode(full_output))
-            total_tokens = prompt_tokens + completion_tokens
+            actual_total = prompt_tokens + completion_tokens
 
-            # TODO (Weekend 2): Settle exact total_tokens in Redis & release unused hold
+            settlement = await ledger.settle(
+                session_id=x_agent_session_id,
+                idempotency_key=idemp_key,
+                actual_tokens=actual_total,
+            )
             print(
-                f"[{x_agent_session_id}] Settled | "
-                f"Prompt: {prompt_tokens} | Completion: {completion_tokens} | "
-                f"Total: {total_tokens}"
+                f"[{x_agent_session_id}] Settled: {settlement['settled_tokens']} | "
+                f"Released Hold: {settlement['released_hold']} | "
+                f"Remaining Budget: {settlement['remaining_budget']}"
             )
 
     return StreamingResponse(
