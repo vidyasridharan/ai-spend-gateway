@@ -11,6 +11,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from gateway.config import settings
+from gateway.guardrails import StreamCircuitBreaker
 from gateway.ledger import SpendLedger
 
 ENCODING = tiktoken.get_encoding("o200k_base")
@@ -90,6 +91,7 @@ async def proxy_chat_completions(
         completion_text_chunks: list[str] = []
         first_token_logged = False
         client: httpx.AsyncClient = request.app.state.http_client
+        breaker = StreamCircuitBreaker(repeat_threshold=3)
 
         try:
             async with client.stream(
@@ -120,14 +122,32 @@ async def proxy_chat_completions(
                             chunk = json.loads(raw_json)
                             delta = chunk["choices"][0].get("delta", {})
                             if "content" in delta and delta["content"]:
-                                completion_text_chunks.append(delta["content"])
+                                content_piece = delta["content"]
+
+                                # 2. Inline Runaway Loop & Velocity Guardrail
+                                is_safe, trip_reason = breaker.inspect_chunk(content_piece)
+                                if not is_safe:
+                                    error_event = json.dumps(
+                                        {
+                                            "error": "CIRCUIT_BREAKER_TRIPPED",
+                                            "reason": trip_reason,
+                                        }
+                                    )
+                                    yield f"data: {error_event}\n\n".encode("utf-8")
+                                    yield b"data: [DONE]\n\n"
+                                    print(
+                                        f"[{x_agent_session_id}] CIRCUIT BREAKER TRIPPED: {trip_reason}"
+                                    )
+                                    break
+
+                                completion_text_chunks.append(content_piece)
                         except (json.JSONDecodeError, KeyError, IndexError):
                             pass
 
                     yield f"{line}\n\n".encode("utf-8")
 
         finally:
-            # 2. Guaranteed Post-Stream Settlement & Hold Release
+            # 3. Guaranteed Post-Stream Settlement & Hold Release
             full_output = "".join(completion_text_chunks)
             completion_tokens = len(ENCODING.encode(full_output))
             actual_total = prompt_tokens + completion_tokens
